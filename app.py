@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 import os
 import mimetypes
 import time
+import threading
 from io import BytesIO
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,18 +19,26 @@ import filetype
 
 def sanitize_name(s):
     """Clean folder names (spaces -> underscore)."""
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return "UNKNOWN"
     clean = "".join(c for c in str(s) if c.isalnum() or c in (' ', '_', '-')).strip()
-    return clean.replace(" ", "_")
+    clean = clean.replace(" ", "_")
+    return clean if clean else "UNKNOWN"
 
 
 def sanitize_store_name(s):
     """Clean store name for filenames, spaces -> dash."""
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return "UNKNOWN"
     clean = "".join(c for c in str(s) if c.isalnum() or c in (' ', '-', '_')).strip()
-    return clean.replace(" ", "-")
+    clean = clean.replace(" ", "-")
+    return clean if clean else "UNKNOWN"
 
 
 def format_date_folder(val):
     """Format a date value into a DD-MM-YYYY folder name."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return "UNKNOWN_DATE"
     try:
         dt = pd.to_datetime(val)
         return dt.strftime('%d-%m-%Y')
@@ -53,8 +62,23 @@ def detect_extension(content, content_type, url):
     return 'jpg'
 
 
-def download_one(session, url, dest_name, folder, timeout=20, max_retries=2):
-    """Download a single file with retries."""
+# Each worker thread gets its own requests.Session (safer than sharing
+# one Session object across threads, which requests does not officially
+# guarantee to be thread-safe).
+_thread_local = threading.local()
+
+
+def get_session(username, password):
+    if not hasattr(_thread_local, "session"):
+        s = requests.Session()
+        s.auth = HTTPBasicAuth(username, password)
+        _thread_local.session = s
+    return _thread_local.session
+
+
+def download_one(username, password, url, dest_name, folder, timeout=20, max_retries=2):
+    """Download a single file with retries. Returns (success, final_name, error)."""
+    session = get_session(username, password)
     last_exc = None
     for attempt in range(max_retries + 1):
         try:
@@ -74,6 +98,22 @@ def download_one(session, url, dest_name, folder, timeout=20, max_retries=2):
             last_exc = str(e)
         time.sleep(0.5 * (attempt + 1))
     return False, None, last_exc
+
+
+def dedupe_columns(columns):
+    """Make duplicate column names unique (e.g. 'MT LINK', 'MT LINK' ->
+    'MT LINK', 'MT LINK__2') so df[col] always returns a scalar Series,
+    never a DataFrame."""
+    seen = {}
+    new_cols = []
+    for c in columns:
+        if c not in seen:
+            seen[c] = 1
+            new_cols.append(c)
+        else:
+            seen[c] += 1
+            new_cols.append(f"{c}__{seen[c]}")
+    return new_cols
 
 
 # -------------------------------------------------------
@@ -101,6 +141,7 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is not None and username and password:
     try:
+        uploaded_file.seek(0)
         if uploaded_file.name.endswith(('.xls', '.xlsx')):
             df = pd.read_excel(uploaded_file)
         else:
@@ -109,8 +150,9 @@ if uploaded_file is not None and username and password:
         st.error(f'Error reading file: {e}')
         st.stop()
 
-    # Normalize column names (strip stray whitespace from headers)
-    df.columns = [str(c).strip() for c in df.columns]
+    # Normalize column names (strip stray whitespace) and de-duplicate
+    # any repeated header names so df[col] never returns a DataFrame.
+    df.columns = dedupe_columns([str(c).strip() for c in df.columns])
 
     st.markdown('**Preview of file**')
     st.dataframe(df.head(50))
@@ -126,8 +168,6 @@ if uploaded_file is not None and username and password:
     if st.button('Start download'):
         with st.spinner("Downloading..."):
             try:
-                session = requests.Session()
-                session.auth = HTTPBasicAuth(username, password)
                 os.makedirs(folder_name, exist_ok=True)
 
                 results = []
@@ -143,6 +183,10 @@ if uploaded_file is not None and username and password:
                 ]
 
                 future_to_row = {}
+                # Track (date_folder, col_clean, dest_name) combos we've already
+                # queued so duplicate ID/store/city rows don't silently overwrite
+                # each other's files or get added to the zip twice.
+                seen_targets = {}
 
                 with ThreadPoolExecutor(max_workers=concurrency) as executor:
                     for _, row in df.iterrows():
@@ -151,27 +195,27 @@ if uploaded_file is not None and username and password:
                         store = sanitize_store_name(row["STORE NAME"])
                         row_id = sanitize_name(row["ID"])
 
-                        dest_name = f"{city}_{store}_{row_id}"
+                        base_dest_name = f"{city}_{store}_{row_id}"
 
                         for col in url_cols:
                             url = str(row[col]).strip()
                             if not (url.startswith("http://") or url.startswith("https://")):
                                 continue
 
-                            # Date -> Link column name folder structure
-                            # IMPORTANT: sanitize the column name ONCE and reuse the same
-                            # sanitized value both for the actual folder on disk and for
-                            # the path we later look up when building the zip. Previously
-                            # the folder was created with sanitize_name(col) but the raw
-                            # (unsanitized) col was stored for the zip step, so paths never
-                            # matched whenever a column name contained spaces (e.g. "PEP
-                            # LINK 1") -> os.path.exists() failed silently -> empty zip.
                             col_clean = sanitize_name(col)
                             col_folder = os.path.join(folder_name, date_folder_name, col_clean)
                             os.makedirs(col_folder, exist_ok=True)
 
+                            # Ensure a unique dest_name within this date/column folder
+                            target_key = (date_folder_name, col_clean, base_dest_name)
+                            seen_targets[target_key] = seen_targets.get(target_key, 0) + 1
+                            if seen_targets[target_key] > 1:
+                                dest_name = f"{base_dest_name}_{seen_targets[target_key]}"
+                            else:
+                                dest_name = base_dest_name
+
                             future = executor.submit(
-                                download_one, session, url, dest_name, col_folder, timeout, max_retries
+                                download_one, username, password, url, dest_name, col_folder, timeout, max_retries
                             )
                             future_to_row[future] = (url, date_folder_name, col_clean, dest_name)
 
@@ -179,6 +223,7 @@ if uploaded_file is not None and username and password:
                     done = 0
                     total = len(future_to_row)
                     log_lines = []
+                    log_placeholder = st.empty()
 
                     if total == 0:
                         st.warning("No valid links found to download.")
@@ -197,8 +242,8 @@ if uploaded_file is not None and username and password:
                             log_lines.append(f'❌ {date_folder_name}/{col_clean}: {url} -> {error}')
                             results.append((url, None, False, error))
 
-                        if done % 10 == 0:
-                            st.text("\n".join(log_lines[-20:]))
+                        if done % 10 == 0 or done == total:
+                            log_placeholder.text("\n".join(log_lines[-20:]))
 
                 succ = sum(1 for r in results if r[2])
                 fail = sum(1 for r in results if not r[2])
@@ -207,12 +252,14 @@ if uploaded_file is not None and username and password:
                 if succ > 0:
                     zip_buffer = BytesIO()
                     missing_files = []
+                    added_arcnames = set()
                     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
                         for _, fname, ok, _ in results:
-                            if ok and fname:
+                            if ok and fname and fname not in added_arcnames:
                                 fpath = os.path.join(folder_name, fname)
                                 if os.path.exists(fpath):
                                     zipf.write(fpath, fname)
+                                    added_arcnames.add(fname)
                                 else:
                                     missing_files.append(fpath)
                     zip_buffer.seek(0)
