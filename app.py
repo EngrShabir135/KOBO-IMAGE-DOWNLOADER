@@ -159,13 +159,21 @@ if uploaded_file is not None and username and password:
                                 continue
 
                             # Date -> Link column name folder structure
-                            col_folder = os.path.join(folder_name, date_folder_name, sanitize_name(col))
+                            # IMPORTANT: sanitize the column name ONCE and reuse the same
+                            # sanitized value both for the actual folder on disk and for
+                            # the path we later look up when building the zip. Previously
+                            # the folder was created with sanitize_name(col) but the raw
+                            # (unsanitized) col was stored for the zip step, so paths never
+                            # matched whenever a column name contained spaces (e.g. "PEP
+                            # LINK 1") -> os.path.exists() failed silently -> empty zip.
+                            col_clean = sanitize_name(col)
+                            col_folder = os.path.join(folder_name, date_folder_name, col_clean)
                             os.makedirs(col_folder, exist_ok=True)
 
                             future = executor.submit(
                                 download_one, session, url, dest_name, col_folder, timeout, max_retries
                             )
-                            future_to_row[future] = (url, date_folder_name, col, dest_name)
+                            future_to_row[future] = (url, date_folder_name, col_clean, dest_name)
 
                     progress_bar = st.progress(0)
                     done = 0
@@ -176,17 +184,17 @@ if uploaded_file is not None and username and password:
                         st.warning("No valid links found to download.")
 
                     for future in as_completed(future_to_row):
-                        url, date_folder_name, col, dest_name = future_to_row[future]
+                        url, date_folder_name, col_clean, dest_name = future_to_row[future]
                         success, final_name, error = future.result()
                         done += 1
                         if total:
                             progress_bar.progress(done / total)
 
                         if success:
-                            log_lines.append(f'✅ {date_folder_name}/{col}: {dest_name} -> {final_name}')
-                            results.append((url, os.path.join(date_folder_name, col, final_name), True, None))
+                            log_lines.append(f'✅ {date_folder_name}/{col_clean}: {dest_name} -> {final_name}')
+                            results.append((url, os.path.join(date_folder_name, col_clean, final_name), True, None))
                         else:
-                            log_lines.append(f'❌ {date_folder_name}/{col}: {url} -> {error}')
+                            log_lines.append(f'❌ {date_folder_name}/{col_clean}: {url} -> {error}')
                             results.append((url, None, False, error))
 
                         if done % 10 == 0:
@@ -198,14 +206,22 @@ if uploaded_file is not None and username and password:
 
                 if succ > 0:
                     zip_buffer = BytesIO()
+                    missing_files = []
                     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
                         for _, fname, ok, _ in results:
                             if ok and fname:
                                 fpath = os.path.join(folder_name, fname)
                                 if os.path.exists(fpath):
                                     zipf.write(fpath, fname)
+                                else:
+                                    missing_files.append(fpath)
                     zip_buffer.seek(0)
                     st.download_button("Download ZIP", data=zip_buffer, file_name=f"{folder_name}.zip")
+                    if missing_files:
+                        st.warning(
+                            f"{len(missing_files)} file(s) were marked successful but not found on disk "
+                            f"when zipping. First few: {missing_files[:5]}"
+                        )
 
                 if fail > 0:
                     failed_links = [url for url, _, ok, _ in results if not ok]
